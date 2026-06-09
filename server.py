@@ -63,6 +63,7 @@ def get_name(sock, names, idx, barrier):
 
 def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
     sep = '─' * 42
+    spectators = [i for i in range(len(socks)) if i not in active]
 
     # Cabeçalho da rodada — ativos jogam, eliminados assistem
     for i in range(len(socks)):
@@ -72,7 +73,7 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
                        f' Aposta fixa: {BET}  |  Suas fichas: {balances[i]}\n{sep}'})
         else:
             send(socks[i], {'type':'info',
-                'msg': f'\n{sep}\n Rodada {rnd}  (você está eliminado)\n{sep}'})
+                'msg': f'\n{sep}\n Rodada {rnd}  (você está eliminado — assistindo)\n{sep}'})
 
     log(f'\n{sep}\n {BLD}RODADA {rnd}{RST} | Dealer: {cn[dealer_idx]}')
     log(' Fichas: ' + ' | '.join(f'{cn[i]}={balances[i]}' for i in range(len(socks))))
@@ -92,6 +93,13 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
         send(socks[i], {'type':'info',
             'msg': f'Suas cartas: {fmt(hands[i])} [{hand_val(hands[i])}]'})
 
+    # Espectadores veem todas as mãos iniciais
+    if spectators:
+        spec_hands = '\n'.join(
+            f'  {names[i]}: {fmt(hands[i])} [{hand_val(hands[i])}]' for i in active)
+        for s in spectators:
+            send(socks[s], {'type':'info', 'msg': f'Cartas iniciais:\n{spec_hands}'})
+
     busted = {i: False for i in active}
 
     # Turno: esquerda do dealer → ... → dealer
@@ -99,7 +107,7 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
     order = active[dp+1:] + active[:dp+1]
 
     for i in order:
-        for j in active:
+        for j in range(len(socks)):
             send(socks[j], {'type':'info', 'msg': f'\n▶ Vez de {names[i]}'})
 
         while True:
@@ -116,11 +124,14 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
                 card = deck.pop()
                 hands[i].append(card)
                 v = hand_val(hands[i])
-                # Só o jogador vê a carta recebida
+                # Só o jogador vê a carta recebida; espectadores veem tudo (visão do servidor)
                 send(socks[i], {'type':'info',
                     'msg': f'  Carta: {card[0]+card[1]}  →  Mão: {fmt(hands[i])} [{v}]'})
                 for j in active:
                     if j != i: send(socks[j], {'type':'info', 'msg': f'  {names[i]} pediu carta.'})
+                for s in spectators:
+                    send(socks[s], {'type':'info',
+                        'msg': f'  {names[i]} pediu: {card[0]+card[1]}  →  {fmt(hands[i])} [{v}]'})
                 log(f'   {cn[i]} hit: {card[0]+card[1]} → [{v}]')
 
                 if v > 21:
@@ -128,17 +139,24 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
                     send(socks[i], {'type':'info', 'msg': '  Você ESTOUROU!'})
                     for j in active:
                         if j != i: send(socks[j], {'type':'info', 'msg': f'  {names[i]} ESTOUROU!'})
+                    for s in spectators:
+                        send(socks[s], {'type':'info', 'msg': f'  {names[i]} ESTOUROU!'})
                     log(f'   {cn[i]} {BLD}BUST{RST}')
                     break
                 if v == 21:
                     send(socks[i], {'type':'info', 'msg': '  21! Perfeito.'})
                     for j in active:
                         if j != i: send(socks[j], {'type':'info', 'msg': f'  {names[i]} tem 21!'})
+                    for s in spectators:
+                        send(socks[s], {'type':'info', 'msg': f'  {names[i]} tem 21!'})
                     break
             else:
                 send(socks[i], {'type':'info', 'msg': '  Você parou.'})
                 for j in active:
                     if j != i: send(socks[j], {'type':'info', 'msg': f'  {names[i]} parou.'})
+                for s in spectators:
+                    send(socks[s], {'type':'info',
+                        'msg': f'  {names[i]} parou com {fmt(hands[i])} [{hand_val(hands[i])}].'})
                 log(f'   {cn[i]} stand [{hand_val(hands[i])}]')
                 break
 
@@ -149,18 +167,31 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
     for i in active:
         log(f'   {cn[i]}: {fmt(hands[i])} = {"BUST" if busted[i] else hand_val(hands[i])}')
 
+    if spectators:
+        placar = 'Placar:\n' + '\n'.join(
+            f'  {names[i]}: {fmt(hands[i])} = {"BUST" if busted[i] else hand_val(hands[i])}'
+            for i in active)
+        for s in spectators:
+            send(socks[s], {'type':'info', 'msg': placar})
+
     if not scores:
         log(f' {BLD}TODOS ESTOURARAM{RST} — apostas devolvidas.')
         for i in active:
             balances[i] += BET
             send(socks[i], {'type':'info',
                 'msg': f'\nTodos estouraram! Aposta devolvida.\nSuas fichas: {balances[i]}'})
+        for s in spectators:
+            send(socks[s], {'type':'info', 'msg': '\nTodos estouraram! Apostas devolvidas.'})
         return
 
     best    = max(v for v,_ in scores)
     winners = [i for v,i in scores if v == best]
     share   = pot // len(winners)
-    for i in winners: balances[i] += share
+    remainder = pot % len(winners)
+    received = {}
+    for idx, w in enumerate(winners):
+        received[w] = share + (1 if idx < remainder else 0)
+        balances[w] += received[w]
     win_str = ', '.join(names[i] for i in winners)
 
     if len(winners) > 1:
@@ -169,14 +200,17 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
             f'[{best} pts] | pote {pot} ÷ {len(winners)} = {share} cada')
         for j in active:
             if j in winners:
-                others = ', '.join(names[k] for k in winners if k != j)
+                others = ', '.join(names[m] for m in winners if m != j)
                 send(socks[j], {'type':'info',
                     'msg': f'\n⚖  EMPATE com {others}!'
-                           f'\n   Pote dividido — cada um recebeu {share} fichas.'
+                           f'\n   Pote dividido — você recebeu {received[j]} fichas.'
                            f'\n   Suas fichas: {balances[j]}'})
             else:
                 send(socks[j], {'type':'info',
                     'msg': f'\n⚖  Empate entre {win_str}. Suas fichas: {balances[j]}'})
+        for s in spectators:
+            send(socks[s], {'type':'info',
+                'msg': f'\n⚖  Empate entre {win_str} [{best} pts]. Pote: {pot}.'})
     else:
         # ── vitória única ─────────────────────────────────────────────────────
         log(f' Vencedor: {cn[winners[0]]} [{best}] | pote {pot}')
@@ -187,6 +221,9 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
             else:
                 send(socks[j], {'type':'info',
                     'msg': f'\nRodada encerrada. Venceu: {win_str}. Suas fichas: {balances[j]}'})
+        for s in spectators:
+            send(socks[s], {'type':'info',
+                'msg': f'\nRodada encerrada. Venceu: {win_str} [{best}]. Pote: {pot}.'})
 
     # Notifica recém-eliminados
     for i in active:
@@ -199,7 +236,10 @@ def play_round(rnd, active, socks, names, balances, dealer_idx, cn):
 
 def stop_vote(active, socks, names, cn):
     """Pergunta a cada ativo se quer parar. Retorna True somente se unanimidade."""
+    spectators = [i for i in range(len(socks)) if i not in active]
     log(f'\n {BLD}Votação de parada:{RST}')
+    for s in spectators:
+        send(socks[s], {'type':'info', 'msg': '\nVotação de parada em andamento...'})
     stops = 0
     for i in active:
         while True:
@@ -212,6 +252,8 @@ def stop_vote(active, socks, names, cn):
         for j in active:
             if j != i:
                 send(socks[j], {'type':'info', 'msg': f'  {names[i]} {label.lower()}.'})
+        for s in spectators:
+            send(socks[s], {'type':'info', 'msg': f'  {names[i]} {label.lower()}.'})
         if v == 'N': stops += 1
     return stops == len(active)
 
